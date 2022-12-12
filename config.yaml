@@ -1,0 +1,27 @@
+image_types:
+  - .png
+  - .apng
+  - .avif
+  - .gif
+  - .jpg
+  - .jpeg
+  - .jfif
+  - .pjpeg
+  - .pjp
+  - .svg
+  - .webp
+
+ocr:
+  dataset: C:\Users\Danie\datasets\iam
+  type: sentences
+  cnn_model: resnet18
+  weights: ""
+  device: cuda
+  test: False
+  save_dir: C:\Users\Danie\PycharmProjects\base_ocr\resnet18_log
+  n_epochs: 300
+  batch_size: 32
+  num_workers: 0
+  max_height: 32
+  max_width: 2048
+
