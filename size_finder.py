@@ -54,7 +54,7 @@ def main() -> None:
     width, image_label = find_max_resized_width(
         path=args.root,
         resized_height=args.height,
-        image_types=config["size_finder"]["image_types"]
+        image_types=config["image_types"]
     )
 
     print(f"Image label: {image_label}\n"

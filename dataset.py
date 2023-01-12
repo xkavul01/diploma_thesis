@@ -17,7 +17,8 @@ class IAMDataset(Dataset):
                  augmentation: bool,
                  split: str,
                  max_height: int,
-                 max_width: int
+                 max_width: int,
+                 max_length: int
                  ) -> None:
         self._image_paths, self._labels = self._load_image_paths(image_names,
                                                                  all_annotations,
@@ -26,6 +27,7 @@ class IAMDataset(Dataset):
         self._alphabet = alphabet
         self._max_height = max_height
         self._max_width = max_width
+        self._max_length = max_length
         self._augmentation = augmentation
         if self._augmentation:
             self._aug_pipeline = iaa.Sequential([
@@ -89,11 +91,11 @@ class IAMDataset(Dataset):
 
         encoded_annotation = []
         annotation = self._labels[index]
-        for idx in range(100):
-            if idx < len(annotation):
-                encoded_annotation.append(self._alphabet.index(annotation[idx]))
+        for i in range(self._max_length):
+            if i < len(annotation):
+                encoded_annotation.append(self._alphabet.index(annotation[i]))
             else:
-                encoded_annotation.append(0)
+                encoded_annotation.append(len(self._alphabet) - 1)
         encoded_annotation = torch.Tensor(encoded_annotation)
 
         return image, encoded_annotation, len(annotation)

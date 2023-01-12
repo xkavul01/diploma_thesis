@@ -1,5 +1,6 @@
 from typing import List
 import argparse
+import os
 import os.path as osp
 
 import matplotlib.pyplot as plt
@@ -35,6 +36,9 @@ def retrieve_number_of_epochs(lines: List[str]) -> int:
 
 
 def plot_ctc_loss(text_file: str, save_dir: str) -> None:
+    if not osp.exists(save_dir):
+        os.makedirs(save_dir)
+
     f = open(text_file, "r")
     lines = f.readlines()
     f.close()

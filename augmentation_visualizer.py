@@ -9,9 +9,11 @@ import torch
 import torchvision.transforms.functional as F
 import imgaug.augmenters as iaa
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 
 def pad_image(sample: torch.Tensor) -> torch.Tensor:
-    result = torch.zeros(3, 32, 1024, dtype=torch.uint8)
+    result = torch.zeros(3, 32, 1536, dtype=torch.uint8)
     result[:, :, :sample.shape[2]] = sample
 
     return result
@@ -43,8 +45,8 @@ def main(dataset: str, save_dir: str, image_types: List[str]) -> None:
         iaa.Resize({"height": 32, "width": "keep-aspect-ratio"}),
         iaa.GammaContrast((0.5, 2.0), per_channel=True),
         iaa.MultiplyAndAddToBrightness(mul=(0.5, 1.3), add=(-30, 30)),
-        iaa.GaussianBlur(sigma=(0, 1.5)),
-        iaa.AdditiveGaussianNoise(scale=(0, 0.05 * 255)),
+        iaa.GaussianBlur(sigma=(0, 2.5)),
+        iaa.AdditiveGaussianNoise(scale=(0, 0.15 * 255)),
         iaa.ScaleX((0.8, 1.0)),
         iaa.ScaleY((0.8, 1.0)),
         iaa.ShearX((-10, 10))

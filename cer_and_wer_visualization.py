@@ -1,5 +1,6 @@
 from typing import List, Tuple
 import argparse
+import os
 import os.path as osp
 
 import matplotlib.pyplot as plt
@@ -10,6 +11,9 @@ def retrieve_cer_and_wer(lines: List[str]) -> Tuple[List[float], List[float]]:
     wer = []
 
     for line in lines:
+        if "Final" in line:
+            continue
+
         if "CER" in line:
             cer.append(float(line.split()[3]))
             wer.append(float(line.split()[5]))
@@ -21,6 +25,9 @@ def retrieve_number_of_epochs(lines: List[str]) -> int:
     epochs = []
 
     for line in lines:
+        if "Final" in line:
+            continue
+
         epoch = int(line.split()[1].split("/")[0][1:])
         epochs.append(epoch)
 
@@ -28,6 +35,9 @@ def retrieve_number_of_epochs(lines: List[str]) -> int:
 
 
 def plot_cer_and_wer(text_file: str, save_dir: str) -> None:
+    if not osp.exists(save_dir):
+        os.makedirs(save_dir)
+
     f = open(text_file, "r")
     lines = f.readlines()
     f.close()

@@ -1,12 +1,8 @@
 import argparse
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--file", type=str, help="Path to the text file.")
-    args = parser.parse_args()
-
-    f = open(args.file, "r")
+def find_max_length(path_to_file: str) -> int:
+    f = open(path_to_file, "r")
     lines = f.readlines()
     f.close()
 
@@ -17,6 +13,15 @@ def main():
             if max_length < len(line):
                 max_length = len(line)
 
+    return max_length
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file", type=str, help="Path to the text file.")
+    args = parser.parse_args()
+
+    max_length = find_max_length(args.file)
     print(max_length)
 
 

@@ -1,10 +1,11 @@
-import time
 from datetime import datetime
 from typing import List, Tuple
 import argparse
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import os.path as osp
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,11 +13,37 @@ import yaml
 from torch.utils.data import DataLoader
 import torch.optim
 from torch.optim import Adam
-from torchaudio.models.decoder._ctc_decoder import ctc_decoder, CTCDecoder
 from jiwer import cer, wer
 
 from dataset import IAMDataset
 from model.encoder import Encoder
+from size_finder import find_max_resized_width
+from length_finder import find_max_length
+
+
+# scores_probs should be N,C,T, blank is last class
+def greedy_decode_ctc(scores_probs, chars):
+    if len(scores_probs.shape) == 2:
+        scores_probs = torch.cat((scores_probs[:, 0:1], scores_probs), axis=1)
+        scores_probs[:, 0] = -1000
+        scores_probs[-1, 1] = 1000
+    else:
+        scores_probs = torch.cat((scores_probs[:, :, 0:1], scores_probs), axis=2)
+        scores_probs[:, :, 0] = -1000
+        scores_probs[:, -1, 0] = 1000
+
+    best = torch.argmax(scores_probs, 1) + 1
+    mask = best[:, :-1] == best[:, 1:]
+    best = best[:, 1:]
+    best[mask] = 0
+    best[best == scores_probs.shape[1]] = 0
+    best = best.cpu().numpy() - 1
+
+    outputs = []
+    for line in best:
+        line = line[np.nonzero(line >= 0)]
+        outputs.append(''.join([chars[c] for c in line]))
+    return outputs
 
 
 def create_alphabet(all_labels: List[str]) -> List[str]:
@@ -26,9 +53,28 @@ def create_alphabet(all_labels: List[str]) -> List[str]:
 
     alphabet = list(set(tmp))
     alphabet.sort()
-    alphabet = ["_"] + alphabet + ["|", "<unk>"]
+    if len(alphabet) % 2 == 0:
+        alphabet = alphabet + ["<UNK>"] + ["<BLANK>"]
+    else:
+        alphabet = alphabet + ["<BLANK>"]
 
     return alphabet
+
+
+def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, int]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    final_annotations = []
+    images = []
+    annotations_length = []
+    for (i, (image, annotation, annotation_length)) in enumerate(batch):
+        images.append(image.unsqueeze(0))
+        trimmed_annotation = annotation[:annotation_length]
+        final_annotations.append(trimmed_annotation)
+        annotations_length.append(int(annotation_length))
+    images = torch.cat(images)
+    final_annotations = torch.cat(final_annotations, dim=0)
+    annotations_length = torch.IntTensor(annotations_length)
+
+    return images, final_annotations, annotations_length
 
 
 def train(model: nn.Module,
@@ -55,7 +101,7 @@ def train(model: nn.Module,
 
         outputs = model(images)
         outputs = F.log_softmax(outputs, dim=2)
-        output_lengths = torch.full(size=(images.shape[0],), fill_value=outputs.shape[0], dtype=torch.long).to(device)
+        output_lengths = torch.full(size=(outputs.shape[1],), fill_value=outputs.shape[0], dtype=torch.long).to(device)
         loss = loss_function(outputs, labels, output_lengths, label_lengths)
 
         loss.backward()
@@ -75,7 +121,6 @@ def train(model: nn.Module,
 
 @torch.no_grad()
 def evaluation(model: nn.Module,
-               decoder: CTCDecoder,
                loader: DataLoader,
                device: torch.device,
                epoch: int,
@@ -97,33 +142,20 @@ def evaluation(model: nn.Module,
 
         outputs = model(images)
         outputs = F.softmax(outputs, dim=2)
-        outputs = outputs.permute(1, 0, 2).cpu()
+        outputs = outputs.permute(1, 2, 0)
+        outputs = greedy_decode_ctc(outputs, alphabet)
 
-        start = time.time()
-        decoded_sequences = decoder(outputs)
-        end = time.time()
+        annotations = []
+        count = 0
+        for length in label_lengths:
+            annotation = ""
+            for j in range(int(length)):
+                annotation = annotation + alphabet[int(labels[count + j])]
+            count += int(length)
+            annotations.append(annotation)
 
-        for j in range(len(decoded_sequences)):
-            translated_sequence = ""
-            decoded_sequence = decoded_sequences[j][0].tokens
-            for k in range(decoded_sequence.shape[0]):
-                translated_sequence = translated_sequence + alphabet[int(decoded_sequence[k])]
-            hypotheses.append(translated_sequence)
-
-        for j in range(labels.shape[0]):
-            translated_label = ""
-            for k in range(label_lengths[j]):
-                translated_label = translated_label + alphabet[int(labels[j][k])]
-            ground_truths.append(translated_label)
-
-        if i % 10 == 0:
-            elapsed = end - start
-            log = f"Epoch: [{epoch + 1}/{n_epochs}]\t" \
-                  f"Batch: [{i}/{len(loader.dataset) // loader.batch_size}]\t" \
-                  f"Decoding time: {elapsed * 1000} ms"
-            print(log)
-            with open(save_log, "a") as f:
-                f.write(log + "\n")
+        hypotheses.extend(outputs)
+        ground_truths.extend(annotations)
 
     cer_value = cer(ground_truths, hypotheses)
     wer_value = wer(ground_truths, hypotheses)
@@ -155,8 +187,9 @@ def run(dataset: str,
         n_epochs: int,
         batch_size: int,
         num_workers: int,
-        max_width: int,
-        max_height: int
+        max_height: int,
+        num_layers: int,
+        image_types: List[str]
         ) -> None:
     f = open(osp.join(dataset, "ground_truths", type + ".txt"), "r")
     lines = f.readlines()
@@ -171,47 +204,57 @@ def run(dataset: str,
     alphabet = create_alphabet(all_annotations)
 
     path_to_folder = osp.join(dataset, type)
+    max_width, _ = find_max_resized_width(path_to_folder, max_height, image_types)
+    tmp = int(round(max_width / 256))
+    final_max_width = tmp * 256 + 256 if max_width / 256 > tmp else tmp * 256
+    max_length = find_max_length(osp.join(dataset, "ground_truths", type + ".txt"))
     train_split = IAMDataset(image_names=image_names,
                              all_annotations=all_annotations,
                              alphabet=alphabet,
                              path_to_folder=path_to_folder,
                              augmentation=True,
                              split=osp.join(dataset, "splits", "trainset.txt"),
-                             max_width=max_width,
-                             max_height=max_height)
+                             max_width=final_max_width,
+                             max_height=max_height,
+                             max_length=max_length)
     valid_split = IAMDataset(image_names=image_names,
                              all_annotations=all_annotations,
                              alphabet=alphabet,
                              path_to_folder=path_to_folder,
                              augmentation=False,
                              split=osp.join(dataset, "splits", "validationset1.txt"),
-                             max_width=max_width,
-                             max_height=max_height)
+                             max_width=final_max_width,
+                             max_height=max_height,
+                             max_length=max_length)
     test_split = IAMDataset(image_names=image_names,
                             all_annotations=all_annotations,
                             alphabet=alphabet,
                             path_to_folder=path_to_folder,
                             augmentation=False,
                             split=osp.join(dataset, "splits", "testset.txt"),
-                            max_width=max_width,
-                            max_height=max_height)
+                            max_width=final_max_width,
+                            max_height=max_height,
+                            max_length=max_length)
 
     pin_memory = device == "cuda"
     train_loader = DataLoader(dataset=train_split,
                               batch_size=batch_size,
                               shuffle=True,
                               num_workers=num_workers,
-                              pin_memory=pin_memory)
+                              pin_memory=pin_memory,
+                              collate_fn=collate_fn)
     valid_loader = DataLoader(dataset=valid_split,
                               batch_size=batch_size,
                               shuffle=False,
                               num_workers=num_workers,
-                              pin_memory=pin_memory)
+                              pin_memory=pin_memory,
+                              collate_fn=collate_fn)
     test_loader = DataLoader(dataset=test_split,
                              batch_size=batch_size,
                              shuffle=False,
                              num_workers=num_workers,
-                             pin_memory=pin_memory)
+                             pin_memory=pin_memory,
+                             collate_fn=collate_fn)
 
     if not osp.exists(save_dir):
         os.mkdir(save_dir)
@@ -223,18 +266,19 @@ def run(dataset: str,
     eval_log = f"eval_log_{current_datetime}.txt"
 
     torch_device = torch.device(device)
-    model = Encoder(cnn_model=cnn_model, alphabet=alphabet).to(torch_device)
-    loss_function = nn.CTCLoss().to(torch_device)
+    model = Encoder(cnn_model=cnn_model, num_layers=num_layers, alphabet=alphabet).to(torch_device)
+    loss_function = nn.CTCLoss(zero_infinity=True, blank=len(alphabet) - 1).to(torch_device)
     optimizer = Adam(model.parameters(), lr=0.0001)
-    decoder = ctc_decoder(lexicon=None, tokens=alphabet, blank_token="_")
     min_cer = -1
     start_epoch = -1
+    running_loss = 0.0
 
     if weights != "":
         if osp.exists(weights):
             checkpoint = torch.load(weights, map_location=torch.device("cpu"))
             start_epoch = checkpoint["epoch"]
             min_cer = checkpoint["min_cer"]
+            running_loss = checkpoint["running_loss"]
             optimizer.load_state_dict(checkpoint["optimizer"])
             model.load_state_dict(checkpoint["model"])
         else:
@@ -242,7 +286,6 @@ def run(dataset: str,
 
     if test:
         evaluation(model,
-                   decoder,
                    test_loader,
                    torch_device,
                    -1,
@@ -250,8 +293,6 @@ def run(dataset: str,
                    osp.join(save_dir, eval_log),
                    alphabet)
     else:
-        running_loss = 0.0
-
         for epoch in range(start_epoch + 1, n_epochs):
             running_loss = train(model,
                                  loss_function,
@@ -263,7 +304,6 @@ def run(dataset: str,
                                  n_epochs,
                                  osp.join(save_dir, train_log))
             cer_value, wer_value = evaluation(model,
-                                              decoder,
                                               valid_loader,
                                               torch_device,
                                               epoch,
@@ -273,6 +313,7 @@ def run(dataset: str,
             checkpoint = {
                 "epoch": epoch,
                 "min_cer": min_cer,
+                "running_loss": running_loss,
                 "optimizer": optimizer.state_dict(),
                 "model": model.state_dict()
             }
@@ -285,7 +326,6 @@ def run(dataset: str,
         best_model = torch.load(osp.join(save_model, "model_best.pth"))
         model.load_state_dict(best_model["model"])
         evaluation(model,
-                   decoder,
                    test_loader,
                    torch_device,
                    -1,
@@ -312,5 +352,6 @@ if __name__ == '__main__':
         config["ocr"]["n_epochs"],
         config["ocr"]["batch_size"],
         config["ocr"]["num_workers"],
-        config["ocr"]["max_width"],
-        config["ocr"]["max_height"])
+        config["ocr"]["max_height"],
+        config["ocr"]["num_layers"],
+        config["image_types"])
