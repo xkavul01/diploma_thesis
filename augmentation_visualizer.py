@@ -1,6 +1,7 @@
 from typing import List
 import argparse
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import os.path as osp
 
 import yaml
@@ -8,8 +9,6 @@ import cv2
 import torch
 import torchvision.transforms.functional as F
 import imgaug.augmenters as iaa
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 def pad_image(sample: torch.Tensor) -> torch.Tensor:

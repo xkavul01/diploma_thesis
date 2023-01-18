@@ -13,12 +13,17 @@ import yaml
 from torch.utils.data import DataLoader
 import torch.optim
 from torch.optim import Adam
+from torch.optim.lr_scheduler import StepLR
 from jiwer import cer, wer
 
 from dataset import IAMDataset
 from model.encoder import Encoder
 from size_finder import find_max_resized_width
 from length_finder import find_max_length
+from model.autoregressive_decoder import AutoregressiveDecoder
+from model.mp_ctc import MPCTC
+from model.ctc_enhanced import CTCEnhanced
+from model.ocr_model import OCRModel
 
 
 # scores_probs should be N,C,T, blank is last class
@@ -53,10 +58,7 @@ def create_alphabet(all_labels: List[str]) -> List[str]:
 
     alphabet = list(set(tmp))
     alphabet.sort()
-    if len(alphabet) % 2 == 0:
-        alphabet = alphabet + ["<UNK>"] + ["<BLANK>"]
-    else:
-        alphabet = alphabet + ["<BLANK>"]
+    alphabet = ["<SOS>"] + alphabet + ["<BLANK>"]
 
     return alphabet
 
@@ -82,12 +84,15 @@ def train(model: nn.Module,
           loader: DataLoader,
           device: torch.device,
           optimizer: torch.optim,
-          running_loss: float,
           epoch: int,
           n_epochs: int,
-          save_log: str
-          ) -> float:
+          save_log: str,
+          decoder: str,
+          alphabet: List[str]
+          ) -> None:
     model.train()
+    hypotheses = []
+    ground_truths = []
 
     print("\nTraining\n")
 
@@ -99,28 +104,67 @@ def train(model: nn.Module,
 
         optimizer.zero_grad()
 
-        outputs = model(images)
-        outputs = F.log_softmax(outputs, dim=2)
+        outputs = None
+        if decoder == "base" or decoder == "mp_ctc" or decoder == "ctc_enhanced":
+            outputs = model(images)
+        elif decoder == "autoregressive":
+            target = []
+            count = 0
+            for length in label_lengths:
+                target.append([0])
+                for j in range(1, 96):
+                    if j < int(length):
+                        target[-1].append(int(labels[count + j]))
+                    else:
+                        target[-1].append(len(alphabet) - 1)
+                count += length
+            target = torch.Tensor(target).permute(1, 0).long().to(device)
+            outputs = model(images, target)
+
+        outputs_softmax = F.softmax(outputs, dim=2)
+        outputs_softmax = outputs_softmax.permute(1, 2, 0)
+        outputs_decoded = greedy_decode_ctc(outputs_softmax, alphabet)
+
+        annotations = []
+        count = 0
+        for length in label_lengths:
+            annotation = ""
+            for j in range(int(length)):
+                annotation = annotation + alphabet[int(labels[count + j])]
+            count += int(length)
+            annotations.append(annotation)
+
+        hypotheses.extend(outputs_decoded)
+        ground_truths.extend(annotations)
+
+        outputs_log_softmax = F.log_softmax(outputs, dim=2)
         output_lengths = torch.full(size=(outputs.shape[1],), fill_value=outputs.shape[0], dtype=torch.long).to(device)
-        loss = loss_function(outputs, labels, output_lengths, label_lengths)
+        loss = loss_function(outputs_log_softmax, labels, output_lengths, label_lengths)
 
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item()
         if i % 10 == 0:
             log = f"Epoch: [{epoch + 1}/{n_epochs}]\t" \
                   f"Batch: [{i}/{len(loader.dataset) // loader.batch_size}]\t" \
-                  f"ctc_loss: {loss.item()} ({running_loss / (epoch * (len(loader.dataset) // loader.batch_size) + i)})"
+                  f"ctc_loss: {loss.item()}"
             print(log)
             with open(save_log, "a") as f:
                 f.write(log + "\n")
 
-    return running_loss
+    cer_value = cer(ground_truths, hypotheses)
+    wer_value = wer(ground_truths, hypotheses)
+    log = f"Epoch: [{epoch + 1}/{n_epochs}]\t" \
+          f"CER: {cer_value}\t" \
+          f"WER: {wer_value}"
+    print(log)
+    with open(save_log, "a") as f:
+        f.write(log + "\n\n")
 
 
 @torch.no_grad()
 def evaluation(model: nn.Module,
+               loss_function: nn.Module,
                loader: DataLoader,
                device: torch.device,
                epoch: int,
@@ -141,9 +185,9 @@ def evaluation(model: nn.Module,
         label_lengths = label_lengths.to(device)
 
         outputs = model(images)
-        outputs = F.softmax(outputs, dim=2)
-        outputs = outputs.permute(1, 2, 0)
-        outputs = greedy_decode_ctc(outputs, alphabet)
+        outputs_softmax = F.softmax(outputs, dim=2)
+        outputs_softmax = outputs_softmax.permute(1, 2, 0)
+        outputs_decoded = greedy_decode_ctc(outputs_softmax, alphabet)
 
         annotations = []
         count = 0
@@ -154,8 +198,20 @@ def evaluation(model: nn.Module,
             count += int(length)
             annotations.append(annotation)
 
-        hypotheses.extend(outputs)
+        hypotheses.extend(outputs_decoded)
         ground_truths.extend(annotations)
+
+        outputs_log_softmax = F.log_softmax(outputs, dim=2)
+        output_lengths = torch.full(size=(outputs.shape[1],), fill_value=outputs.shape[0], dtype=torch.long).to(device)
+        loss = loss_function(outputs_log_softmax, labels, output_lengths, label_lengths)
+
+        if i % 10 == 0 and epoch != -1:
+            log = f"Epoch: [{epoch + 1}/{n_epochs}]\t" \
+                  f"Batch: [{i}/{len(loader.dataset) // loader.batch_size}]\t" \
+                  f"ctc_loss: {loss.item()}"
+            print(log)
+            with open(save_log, "a") as f:
+                f.write(log + "\n")
 
     cer_value = cer(ground_truths, hypotheses)
     wer_value = wer(ground_truths, hypotheses)
@@ -172,7 +228,7 @@ def evaluation(model: nn.Module,
               f"WER: {wer_value}"
         print(log)
         with open(save_log, "a") as f:
-            f.write(log + "\n")
+            f.write(log + "\n\n")
 
     return cer_value, wer_value
 
@@ -189,6 +245,7 @@ def run(dataset: str,
         num_workers: int,
         max_height: int,
         num_layers: int,
+        decoder: str,
         image_types: List[str]
         ) -> None:
     f = open(osp.join(dataset, "ground_truths", type + ".txt"), "r")
@@ -208,6 +265,7 @@ def run(dataset: str,
     tmp = int(round(max_width / 256))
     final_max_width = tmp * 256 + 256 if max_width / 256 > tmp else tmp * 256
     max_length = find_max_length(osp.join(dataset, "ground_truths", type + ".txt"))
+
     train_split = IAMDataset(image_names=image_names,
                              all_annotations=all_annotations,
                              alphabet=alphabet,
@@ -217,6 +275,7 @@ def run(dataset: str,
                              max_width=final_max_width,
                              max_height=max_height,
                              max_length=max_length)
+
     valid_split = IAMDataset(image_names=image_names,
                              all_annotations=all_annotations,
                              alphabet=alphabet,
@@ -226,6 +285,7 @@ def run(dataset: str,
                              max_width=final_max_width,
                              max_height=max_height,
                              max_length=max_length)
+
     test_split = IAMDataset(image_names=image_names,
                             all_annotations=all_annotations,
                             alphabet=alphabet,
@@ -243,12 +303,14 @@ def run(dataset: str,
                               num_workers=num_workers,
                               pin_memory=pin_memory,
                               collate_fn=collate_fn)
+
     valid_loader = DataLoader(dataset=valid_split,
                               batch_size=batch_size,
                               shuffle=False,
                               num_workers=num_workers,
                               pin_memory=pin_memory,
                               collate_fn=collate_fn)
+
     test_loader = DataLoader(dataset=test_split,
                              batch_size=batch_size,
                              shuffle=False,
@@ -266,26 +328,47 @@ def run(dataset: str,
     eval_log = f"eval_log_{current_datetime}.txt"
 
     torch_device = torch.device(device)
-    model = Encoder(cnn_model=cnn_model, num_layers=num_layers, alphabet=alphabet).to(torch_device)
+
+    model = None
+    if decoder == "base":
+        encoder = Encoder(cnn_model=cnn_model, num_layers=num_layers).to(torch_device)
+        decoder_model = nn.Linear(in_features=2048 if cnn_model == "resnet50" else 512,
+                                  out_features=len(alphabet)).to(torch_device)
+        model = OCRModel(encoder=encoder, decoder=decoder_model, decoder_str=decoder).to(torch_device)
+    elif decoder == "autoregressive":
+        encoder = Encoder(cnn_model=cnn_model, num_layers=num_layers).to(torch_device)
+        decoder_model = AutoregressiveDecoder(num_layers=6, cnn=cnn_model, alphabet=alphabet).to(torch_device)
+        model = OCRModel(encoder=encoder, decoder=decoder_model, decoder_str=decoder).to(torch_device)
+    elif decoder == "mp_ctc":
+        encoder = Encoder(cnn_model=cnn_model, num_layers=num_layers).to(torch_device)
+        decoder_model = MPCTC(num_layers=6, cnn=cnn_model, threshold=0.4, alphabet=alphabet).to(torch_device)
+        model = OCRModel(encoder=encoder, decoder=decoder_model, decoder_str=decoder).to(torch_device)
+    elif decoder == "ctc_enhanced":
+        encoder = Encoder(cnn_model=cnn_model, num_layers=num_layers).to(torch_device)
+        decoder_model = CTCEnhanced(num_layers=6, cnn=cnn_model, alphabet=alphabet).to(torch_device)
+        model = OCRModel(encoder=encoder, decoder=decoder_model, decoder_str=decoder).to(torch_device)
+
     loss_function = nn.CTCLoss(zero_infinity=True, blank=len(alphabet) - 1).to(torch_device)
     optimizer = Adam(model.parameters(), lr=0.0001)
+    scheduler = StepLR(optimizer, 100)
     min_cer = -1
     start_epoch = -1
-    running_loss = 0.0
+    best_epoch = None
 
     if weights != "":
         if osp.exists(weights):
             checkpoint = torch.load(weights, map_location=torch.device("cpu"))
             start_epoch = checkpoint["epoch"]
             min_cer = checkpoint["min_cer"]
-            running_loss = checkpoint["running_loss"]
             optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
             model.load_state_dict(checkpoint["model"])
         else:
             raise ValueError("Weights do not exist.")
 
     if test:
         evaluation(model,
+                   loss_function,
                    test_loader,
                    torch_device,
                    -1,
@@ -294,38 +377,45 @@ def run(dataset: str,
                    alphabet)
     else:
         for epoch in range(start_epoch + 1, n_epochs):
-            running_loss = train(model,
-                                 loss_function,
-                                 train_loader,
-                                 torch_device,
-                                 optimizer,
-                                 running_loss,
-                                 epoch,
-                                 n_epochs,
-                                 osp.join(save_dir, train_log))
+            train(model,
+                  loss_function,
+                  train_loader,
+                  torch_device,
+                  optimizer,
+                  epoch,
+                  n_epochs,
+                  osp.join(save_dir, train_log),
+                  decoder,
+                  alphabet)
             cer_value, wer_value = evaluation(model,
+                                              loss_function,
                                               valid_loader,
                                               torch_device,
                                               epoch,
                                               n_epochs,
                                               osp.join(save_dir, eval_log),
                                               alphabet)
+            scheduler.step()
             checkpoint = {
                 "epoch": epoch,
                 "min_cer": min_cer,
-                "running_loss": running_loss,
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "model": model.state_dict()
             }
             torch.save(checkpoint, osp.join(save_model, f"model_{epoch}.pth"))
 
             if cer_value < min_cer or min_cer == -1:
                 min_cer = cer_value
+                best_epoch = epoch
                 torch.save(checkpoint, osp.join(save_model, "model_best.pth"))
 
-        best_model = torch.load(osp.join(save_model, "model_best.pth"))
+        with open(osp.join(save_dir, train_log), "a") as f:
+            f.write(f"Epoch of the best model: {best_epoch}\n")
+        best_model = torch.load(osp.join(save_model, "model_best.pth"), map_location=torch.device("cpu"))
         model.load_state_dict(best_model["model"])
         evaluation(model,
+                   loss_function,
                    test_loader,
                    torch_device,
                    -1,
@@ -354,4 +444,5 @@ if __name__ == '__main__':
         config["ocr"]["num_workers"],
         config["ocr"]["max_height"],
         config["ocr"]["num_layers"],
+        config["ocr"]["decoder"],
         config["image_types"])

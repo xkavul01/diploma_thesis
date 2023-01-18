@@ -8,12 +8,11 @@ from torchvision.models.resnet import BasicBlock, Bottleneck
 
 
 class ResNetOCR(ResNet):
-    def __init__(
-            self,
-            block: Type[Union[BasicBlock, Bottleneck]],
-            layers: List[int],
-            **kwargs: Any
-    ):
+    def __init__(self,
+                 block: Type[Union[BasicBlock, Bottleneck]],
+                 layers: List[int],
+                 **kwargs: Any
+                 ):
         super().__init__(block, layers, **kwargs)
 
     def _forward_impl(self, x: Tensor) -> Tensor:
@@ -25,7 +24,7 @@ class ResNetOCR(ResNet):
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        x = self.layer4(x)
+        # x = self.layer4(x)
 
         return x
 

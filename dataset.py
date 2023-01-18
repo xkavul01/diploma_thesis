@@ -18,7 +18,7 @@ class IAMDataset(Dataset):
                  split: str,
                  max_height: int,
                  max_width: int,
-                 max_length: int
+                 max_length: int,
                  ) -> None:
         self._image_paths, self._labels = self._load_image_paths(image_names,
                                                                  all_annotations,
