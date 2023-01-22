@@ -3,7 +3,7 @@ from typing import Optional, Any, Type, Union, List
 from torch import Tensor
 from torchvision.models import ResNet, ResNet50_Weights, ResNet18_Weights, ResNet34_Weights
 from torchvision.models._api import WeightsEnum
-from torchvision.models._utils import handle_legacy_interface, _ovewrite_named_param
+from torchvision.models._utils import _ovewrite_named_param
 from torchvision.models.resnet import BasicBlock, Bottleneck
 
 
@@ -50,21 +50,18 @@ def _resnet(
     return model
 
 
-@handle_legacy_interface(weights=("pretrained", ResNet50_Weights.IMAGENET1K_V1))
 def resnet50(*, weights: Optional[ResNet50_Weights] = None, progress: bool = True, **kwargs: Any) -> ResNet:
     weights = ResNet50_Weights.verify(weights)
 
     return _resnet(Bottleneck, [3, 4, 6, 3], weights, progress, **kwargs)
 
 
-@handle_legacy_interface(weights=("pretrained", ResNet18_Weights.IMAGENET1K_V1))
 def resnet18(*, weights: Optional[ResNet18_Weights] = None, progress: bool = True, **kwargs: Any) -> ResNet:
     weights = ResNet18_Weights.verify(weights)
 
     return _resnet(BasicBlock, [2, 2, 2, 2], weights, progress, **kwargs)
 
 
-@handle_legacy_interface(weights=("pretrained", ResNet34_Weights.IMAGENET1K_V1))
 def resnet34(*, weights: Optional[ResNet34_Weights] = None, progress: bool = True, **kwargs: Any) -> ResNet:
     weights = ResNet34_Weights.verify(weights)
 

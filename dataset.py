@@ -2,8 +2,8 @@ from typing import Tuple, List
 import os.path as osp
 
 import torch
-import torchvision.transforms.functional as F
 from torch.utils.data import Dataset
+import torchvision.transforms.functional as F
 import cv2
 import imgaug.augmenters as iaa
 
@@ -17,8 +17,7 @@ class IAMDataset(Dataset):
                  augmentation: bool,
                  split: str,
                  max_height: int,
-                 max_width: int,
-                 max_length: int,
+                 max_width: int
                  ) -> None:
         self._image_paths, self._labels = self._load_image_paths(image_names,
                                                                  all_annotations,
@@ -27,7 +26,7 @@ class IAMDataset(Dataset):
         self._alphabet = alphabet
         self._max_height = max_height
         self._max_width = max_width
-        self._max_length = max_length
+
         self._augmentation = augmentation
         if self._augmentation:
             self._aug_pipeline = iaa.Sequential([
@@ -91,11 +90,8 @@ class IAMDataset(Dataset):
 
         encoded_annotation = []
         annotation = self._labels[index]
-        for i in range(self._max_length):
-            if i < len(annotation):
-                encoded_annotation.append(self._alphabet.index(annotation[i]))
-            else:
-                encoded_annotation.append(len(self._alphabet) - 1)
+        for i in range(len(annotation)):
+            encoded_annotation.append(self._alphabet.index(annotation[i]))
         encoded_annotation = torch.Tensor(encoded_annotation)
 
         return image, encoded_annotation, len(annotation)
