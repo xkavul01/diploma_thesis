@@ -1,0 +1,34 @@
+image_types:
+  - .png
+  - .apng
+  - .avif
+  - .gif
+  - .jpg
+  - .jpeg
+  - .jfif
+  - .pjpeg
+  - .pjp
+  - .svg
+  - .webp
+
+ocr:
+  dataset: C:\Users\Danie\datasets\iam
+  type: lines
+  cnn_model: vgg16_bn
+  weights: null
+  weights_encoder: C:\Users\Danie\PycharmProjects\diploma_thesis\ocr\vgg16_ctc_shortcut_log\models\model_239.pth
+  device: cpu
+  save_dir: C:\Users\Danie\PycharmProjects\diploma_thesis\ocr\test_log
+  n_epochs: 240
+  batch_size: 2
+  num_workers: 0
+  fixed_height: 128
+  fixed_width: 1792
+  num_layers: 3
+  decoder: lstm_autoregressive
+  learning_rate: 0.001
+  weight_decay: 0.00005
+  dropout: 0.25
+  decoder_loss: focal
+  weight: 0.5
+  encoder_freeze: false
