@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Any
 
 import torch
 import torch.nn as nn
@@ -57,7 +57,8 @@ class Encoder(nn.Module):
         else:
             x = self._cnn(x)
             x = self._max_pool(x).squeeze(2).permute(2, 0, 1)
-            x, _ = self._rnn(x)
+            x, (h_n, _) = self._rnn(x)
+
             y = self._linear_scale(x)
             y = self._tanh(y)
             y = self._dropout(y)

@@ -9,6 +9,32 @@ import cv2
 import imgaug.augmenters as iaa
 
 
+def func_images(images, random_state, parents, hooks):
+    result = []
+
+    for image in images:
+        n_masks = np.random.binomial(2, 0.5) + 1
+
+        for _ in range(n_masks):
+            mask_width = int(np.random.uniform(low=0.01, high=0.04) * image.shape[1])
+            mask_location = np.random.randint(low=0, high=image.shape[1] - mask_width)
+            mask = np.random.randint(low=0, high=256, size=(image.shape[0], mask_width, image.shape[2]))
+
+            image[:, mask_location:mask_location + mask_width] = mask
+
+        result.append(image)
+
+    return result
+
+
+def func_heatmaps(heatmaps, random_state, parents, hooks):
+    return heatmaps
+
+
+def func_keypoints(keypoints_on_images, random_state, parents, hooks):
+    return keypoints_on_images
+
+
 class IAMDataset(Dataset):
     def __init__(self,
                  image_names: List[str],
@@ -16,6 +42,7 @@ class IAMDataset(Dataset):
                  alphabet: List[str],
                  path_to_folder: str,
                  augmentation: bool,
+                 mask: bool,
                  split: str,
                  fixed_height: int,
                  fixed_width: int
@@ -28,8 +55,23 @@ class IAMDataset(Dataset):
         self._fixed_height = fixed_height
         self._fixed_width = fixed_width
 
+        self._mask = mask
         self._augmentation = augmentation
-        if self._augmentation:
+        if self._augmentation and self._mask:
+            mask_augmenter = iaa.Lambda(
+                func_images=func_images,
+                func_heatmaps=func_heatmaps,
+                func_keypoints=func_keypoints
+            )
+            self._aug_pipeline = iaa.Sequential([
+                iaa.GammaContrast((0.5, 2.0), per_channel=True),
+                iaa.MultiplyAndAddToBrightness(mul=(0.5, 1.3), add=(-30, 30)),
+                iaa.GaussianBlur(sigma=(1.75, 2)),
+                iaa.AdditiveGaussianNoise(scale=(0.10 * 255, 0.12 * 255)),
+                mask_augmenter,
+                iaa.Rotate((-3, 3))
+            ])
+        elif self._augmentation:
             self._aug_pipeline = iaa.Sequential([
                 iaa.GammaContrast((0.5, 2.0), per_channel=True),
                 iaa.MultiplyAndAddToBrightness(mul=(0.5, 1.3), add=(-30, 30)),
@@ -93,6 +135,19 @@ class IAMDataset(Dataset):
             border_value = np.median(word_img)
         word_img = np.pad(word_img[ys:ye, xs:xe], (padh, padw, (0, 0)), 'constant', constant_values=border_value)
         return word_img
+
+    @staticmethod
+    def mask_image(image: np.ndarray) -> np.ndarray:
+        n_masks = np.random.binomial(2, 0.5) + 1
+
+        for i in range(n_masks):
+            mask_width = int(np.random.uniform(low=0.01, high=0.04) * image.shape[1])
+            mask_location = np.random.randint(low=0, high=image.shape[1] - mask_width)
+            mask = np.random.randint(low=0, high=256, size=(image.shape[0], mask_width, image.shape[2]))
+
+            image[:, mask_location:mask_location + mask_width] = mask
+
+        return image
 
     def __getitem__(self, index) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         image_path = self._image_paths[index]

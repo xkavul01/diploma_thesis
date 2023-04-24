@@ -4,17 +4,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ocr.model.positional_encoding import PositionalEncoding
+
 
 class CTCEnhanced(nn.Module):
-    def __init__(self, num_layers: int, cnn: str, alphabet: List[str]):
+    def __init__(self, num_layers: int, dropout: float, alphabet: List[str]):
         super(CTCEnhanced, self).__init__()
 
-        embedding_dim = 2048 if cnn == "resnet50" or cnn == "vgg16_bn" else 512
-        decoder_layer = nn.TransformerDecoderLayer(d_model=embedding_dim, nhead=8, dropout=0.25)
-        layer_norm = nn.LayerNorm(embedding_dim)
-        self._decoder = nn.TransformerDecoder(decoder_layer=decoder_layer, num_layers=num_layers, norm=layer_norm)
-        self._embedding_layer = nn.Embedding(num_embeddings=len(alphabet), embedding_dim=embedding_dim)
-        self._linear = nn.Linear(in_features=embedding_dim, out_features=len(alphabet))
+        decoder_layer = nn.TransformerDecoderLayer(d_model=256, nhead=8, dropout=dropout, dim_feedforward=1024)
+        layer_norm = nn.LayerNorm(256)
+        self._decoder = nn.TransformerDecoder(decoder_layer=decoder_layer, num_layers=6, norm=layer_norm)
+        self._embedding_layer = nn.Embedding(num_embeddings=len(alphabet), embedding_dim=256)
+        self._linear = nn.Linear(in_features=256, out_features=len(alphabet))
+        self._positional_encoder = PositionalEncoding(d_model=256, dropout=dropout)
         self._alphabet = alphabet
 
     @staticmethod
@@ -38,16 +40,18 @@ class CTCEnhanced(nn.Module):
             for i in range(ctc_predictions.shape[1]):
                 tmp = ctc_predictions[:, i]
                 ctc_length = tmp[tmp != len(self._alphabet) - 1].shape[0]
-                tmp = target[:, i]
+                tmp = target[i]
                 target_length = tmp[tmp != len(self._alphabet) - 1].shape[0]
                 if abs(ctc_length - target_length) <= 2:
                     output[:, i] = ctc_predictions[:, i]
                 else:
-                    output[:, i] = target[:, i]
+                    output[0, i] = 0
+                    output[1:, i] = target[i, :-1]
         else:
             output = ctc_predictions
 
         target_embedding = self._embedding_layer(output)
+        target_embedding = self._positional_encoder(target_embedding)
         mask = self.generate_square_subsequent_mask(x.shape[0], next(self.parameters()).device)
         x = self._decoder(target_embedding, x, tgt_mask=mask)
         x = self._linear(x)

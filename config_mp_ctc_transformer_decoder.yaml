@@ -12,23 +12,23 @@ image_types:
   - .webp
 
 ocr:
-  dataset: C:\Users\Danie\datasets\iam
+  dataset: /storage/brno2/home/xkavul01/datasets/iam
   type: lines
   cnn_model: vgg16_bn
-  weights: null
-  weights_encoder: C:\Users\Danie\PycharmProjects\diploma_thesis\ocr\vgg16_ctc_shortcut_log\models\model_239.pth
-  device: cpu
-  save_dir: C:\Users\Danie\PycharmProjects\diploma_thesis\ocr\test_log
+  weights: /storage/brno2/home/xkavul01/base_ocr/ocr/vgg16_mp_ctc_log/models/model_180.pth
+  weights_encoder: null
+  device: cuda
+  save_dir: /storage/brno2/home/xkavul01/base_ocr/ocr/vgg16_mp_ctc_log
   n_epochs: 240
-  batch_size: 2
+  batch_size: 16
   num_workers: 0
   fixed_height: 128
   fixed_width: 1792
   num_layers: 3
-  decoder: lstm_autoregressive
+  decoder: mp_ctc
   learning_rate: 0.001
   weight_decay: 0.00005
   dropout: 0.25
-  decoder_loss: focal
-  weight: 0.5
+  weight: 0.7
   encoder_freeze: false
+  mask: false

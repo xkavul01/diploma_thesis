@@ -18,7 +18,7 @@ class VGGOCR(VGG):
         super().__init__(features, num_classes, init_weights, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for i in range(23):
+        for i in range(23): # 23
             x = self.features[i](x)
         return x
 

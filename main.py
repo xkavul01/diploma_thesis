@@ -3,7 +3,6 @@ from datetime import datetime
 from typing import List, Tuple
 import argparse
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import os.path as osp
 
 import yaml
@@ -20,13 +19,56 @@ from jiwer import cer, wer
 from ocr.dataset import IAMDataset
 from ocr.focal_loss import FocalLoss
 from ocr.model.encoder import Encoder
-from ocr.model.autoregressive_decoder import AutoregressiveDecoder
-from ocr.model.mp_ctc import MPCTC
-from ocr.model.ctc_enhanced import CTCEnhanced
-from ocr.model.laso import LASO
 from ocr.model.ctc_lstm import CTCLSTM
-from ocr.model.lstm_autoregressive import LSTMAutoregressive
+from ocr.model.ctc_lstm_self import CTCLSTMSELF
+from ocr.model.ctc_lstm_cross import CTCLSTMCROSS
+from ocr.model.ctc_enhanced import CTCEnhanced
+from ocr.model.mp_ctc_lstm_self import MPCTCLSTMSELF
+from ocr.model.mp_ctc_lstm_cross import MPCTCLSTMCROSS
+from ocr.model.mp_ctc_lstm import MPCTCLSTM
+from ocr.model.mp_ctc import MPCTC
 from ocr.model.ocr_model import OCRModel
+
+
+def mp_ctc_lstm_decode(output: torch.Tensor,
+                       output_ctc: torch.Tensor,
+                       mask_indexes: List[torch.Tensor],
+                       alphabet: List[str]
+                       ) -> List[str]:
+    output, output_predictions = F.softmax(output, dim=-1).max(dim=-1)
+    output_ctc, output_ctc_predictions = F.softmax(output_ctc, dim=-1).max(dim=-1)
+
+    output_ctc_predictions = [torch.unique_consecutive(output_ctc_predictions[:, i])
+                              for i in range(output_ctc.shape[1])]
+    output_ctc_predictions = [output_ctc_predictions[i][output_ctc_predictions[i] != len(alphabet) - 1]
+                              for i in range(output_ctc.shape[1])]
+
+    for i in range(len(mask_indexes)):
+        for j in range(mask_indexes[i].shape[0]):
+            output_ctc_predictions[i][int(mask_indexes[i][j])] = output_predictions[int(mask_indexes[i][j]), i]
+
+    result = []
+    for i in range(len(output_ctc_predictions)):
+        result.append([])
+        for j in range(output_ctc_predictions[i].shape[0]):
+            result[-1].append(alphabet[output_ctc_predictions[i][j]])
+        result[-1] = "".join(result[-1])
+
+    return result
+
+
+"""def mask_cross_entropy(logits: torch.Tensor,
+                       mask_indexes: List[torch.Tensor],
+                       annotations: torch.Tensor
+                       ) -> torch.Tensor:
+    decoder_log_softmax = F.log_softmax(logits, dim=-1)
+    result = torch.zeros(logits.shape[0])
+    for i in range(result.shape[0]):
+        for j in range(annotations[i].shape[0]):
+            if (j == mask_indexes[i]).sum():
+                result[i] -= decoder_log_softmax[i, annotations[i][j], j]
+
+    return torch.mean(result)"""
 
 
 def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]) -> Tuple[torch.Tensor,
@@ -93,27 +135,6 @@ def decode_annotations(labels: torch.Tensor,
     return annotations
 
 
-"""def preprocess_for_transformer_decoder(labels: torch.Tensor,
-                                       label_lengths: torch.Tensor,
-                                       alphabet: List[str],
-                                       decoder: str
-                                       ) -> torch.Tensor:
-    target = []
-    count = 0
-    for length in label_lengths:
-        target.append([0])
-        for j in range(1, 768):
-            if (j - 1) < int(length):
-                target[-1].append(int(labels[count + (j - 1)]))
-            elif decoder == "autoregressive" and (j - 1) == int(length):
-                target[-1].append(1)
-            else:
-                target[-1].append(len(alphabet) - 1)
-        count += length
-
-    return torch.Tensor(target).permute(1, 0).long()"""
-
-
 def decode_sentences(sentences: torch.Tensor, alphabet: List[str]) -> List[str]:
     _, predictions = torch.max(sentences, dim=-1)
 
@@ -152,8 +173,11 @@ def train(model: nn.Module,
     if decoder != "base" and encoder_freeze:
         model.encoder.eval()
         model.decoder.train()
+
     hypotheses = []
     ground_truths = []
+    all_hypotheses = []
+    all_ground_truths = []
     running_loss = 0.0
 
     print("\nTraining\n")
@@ -168,15 +192,21 @@ def train(model: nn.Module,
         optimizer.zero_grad()
 
         outputs, outputs_shortcut, outputs_ctc, outputs_decoded = None, None, None, None
+        mask_indexes = None
         if decoder == "base":
             outputs, outputs_shortcut = model(images)
             outputs_softmax = F.softmax(outputs.detach(), dim=2)
             outputs_softmax = outputs_softmax.permute(1, 2, 0)
             outputs_decoded = greedy_decode_ctc(outputs_softmax, alphabet)
         else:
-            outputs, outputs_ctc = model(images, labels_ce)
-            outputs_softmax = F.softmax(outputs.detach(), dim=2)
-            outputs_decoded = decode_sentences(outputs_softmax, alphabet)
+            if decoder == "mp_ctc_lstm" or decoder == "mp_ctc_lstm_self" or decoder == "mp_ctc_lstm_cross" or \
+                    decoder == "mp_ctc":
+                outputs, outputs_ctc, mask_indexes = model(images)
+                outputs_decoded = mp_ctc_lstm_decode(outputs, outputs_ctc, mask_indexes, alphabet)
+            else:
+                outputs, outputs_ctc = model(images)
+                outputs_softmax = F.softmax(outputs.detach(), dim=2)
+                outputs_decoded = decode_sentences(outputs_softmax, alphabet)
 
         annotations = decode_annotations(labels_ctc, label_lengths, alphabet)
         hypotheses.extend(outputs_decoded)
@@ -216,18 +246,31 @@ def train(model: nn.Module,
         optimizer.step()
 
         if i % 10 == 0:
-            loss_str = "hybrid_loss" if decoder != "base" else "ctc_loss"
             cer_value = cer(ground_truths, hypotheses)
             wer_value = wer(ground_truths, hypotheses)
             log = f"Epoch: [{epoch + 1}/{n_epochs}]\t" \
                   f"Batch: [{i}/{len(loader.dataset) // loader.batch_size}]\t" \
-                  f"{loss_str}: {running_loss / 10.0}\t" \
+                  f"Loss: {running_loss / 10.0}\t" \
                   f"CER: {cer_value}\t" \
                   f"WER: {wer_value}"
             running_loss = 0.0
+            all_hypotheses.extend(hypotheses)
+            all_ground_truths.extend(ground_truths)
+            ground_truths = []
+            hypotheses = []
             print(log)
             with open(save_log, "a") as f:
                 f.write(log + "\n")
+
+    all_ground_truths.extend(ground_truths)
+    all_hypotheses.extend(hypotheses)
+    cer_value = cer(all_ground_truths, all_hypotheses)
+    wer_value = wer(all_ground_truths, all_hypotheses)
+    log = f"CER: {cer_value}\t" \
+          f"WER: {wer_value}"
+    print("\n" + log + "\n")
+    with open(save_log, "a") as f:
+        f.write("\n" + log + "\n\n")
 
 
 @torch.no_grad()
@@ -243,12 +286,15 @@ def evaluation(model: nn.Module,
                decoder: str,
                weight: float,
                encoder_freeze: bool
-               ) -> None:
+               ) -> float:
     model.eval()
     if decoder != "base" and encoder_freeze:
         model.decoder.eval()
+
     ground_truths = []
     hypotheses = []
+    all_ground_truths = []
+    all_hypotheses = []
     running_loss = 0.0
 
     print("\nEvaluating\n")
@@ -261,15 +307,21 @@ def evaluation(model: nn.Module,
         label_lengths = label_lengths.to(device)
 
         outputs, outputs_ctc, outputs_decoded = None, None, None
+        mask_indexes = None
         if decoder == "base":
             outputs, _ = model(images)
             outputs_softmax = F.softmax(outputs.detach(), dim=2)
             outputs_softmax = outputs_softmax.permute(1, 2, 0)
             outputs_decoded = greedy_decode_ctc(outputs_softmax, alphabet)
         else:
-            outputs, outputs_ctc = model(images)
-            outputs_softmax = F.softmax(outputs.detach(), dim=2)
-            outputs_decoded = decode_sentences(outputs_softmax, alphabet)
+            if decoder == "mp_ctc_lstm" or decoder == "mp_ctc_lstm_self" or decoder == "mp_ctc_lstm_cross" or \
+                    decoder == "mp_ctc":
+                outputs, outputs_ctc, mask_indexes = model(images)
+                outputs_decoded = mp_ctc_lstm_decode(outputs, outputs_ctc, mask_indexes, alphabet)
+            else:
+                outputs, outputs_ctc = model(images)
+                outputs_softmax = F.softmax(outputs.detach(), dim=2)
+                outputs_decoded = decode_sentences(outputs_softmax, alphabet)
 
         annotations = decode_annotations(labels_ctc, label_lengths, alphabet)
         hypotheses.extend(outputs_decoded)
@@ -299,18 +351,33 @@ def evaluation(model: nn.Module,
             running_loss += loss.item()
 
         if i % 10 == 0:
-            loss_str = "hybrid_loss" if decoder != "base" else "ctc_loss"
             cer_value = cer(ground_truths, hypotheses)
             wer_value = wer(ground_truths, hypotheses)
             log = f"Epoch: [{epoch + 1}/{n_epochs}]\t" \
                   f"Batch: [{i}/{len(loader.dataset) // loader.batch_size}]\t" \
-                  f"{loss_str}: {running_loss / 10.0}\t" \
+                  f"Loss: {running_loss / 10.0}\t" \
                   f"CER: {cer_value}\t" \
                   f"WER: {wer_value}"
             running_loss = 0.0
+            all_hypotheses.extend(hypotheses)
+            all_ground_truths.extend(ground_truths)
+            ground_truths = []
+            hypotheses = []
             print(log)
             with open(save_log, "a") as f:
                 f.write(log + "\n")
+
+    all_ground_truths.extend(ground_truths)
+    all_hypotheses.extend(hypotheses)
+    cer_value = cer(all_ground_truths, all_hypotheses)
+    wer_value = wer(all_ground_truths, all_hypotheses)
+    log = f"CER: {cer_value}\t" \
+          f"WER: {wer_value}"
+    print("\n" + log + "\n")
+    with open(save_log, "a") as f:
+        f.write("\n" + log + "\n\n")
+
+    return cer_value
 
 
 def init_model(decoder: str,
@@ -326,33 +393,37 @@ def init_model(decoder: str,
         encoder = Encoder(cnn_model, num_layers, alphabet, dropout).to(torch_device)
         return OCRModel(encoder).to(torch_device)
 
-    elif decoder == "autoregressive" or \
-            decoder == "mp_ctc" or \
-            decoder == "ctc_enhanced" or \
-            decoder == "laso" \
-            or decoder == "ctc_lstm" \
-            or decoder == "lstm_autoregressive":
+    elif decoder == "ctc_lstm" or \
+            decoder == "mp_ctc_lstm" or decoder == "mp_ctc_lstm_self" or decoder == "mp_ctc_lstm_cross" or \
+            decoder == "ctc_lstm_self" or decoder == "ctc_lstm_cross" or decoder == "ctc_enhanced" or \
+            decoder == "mp_ctc":
         if encoder_freeze:
             encoder = Encoder(cnn_model, num_layers, alphabet, dropout, decoder).requires_grad_(False).to(torch_device)
         else:
             encoder = Encoder(cnn_model, num_layers, alphabet, dropout, decoder).to(torch_device)
-        weights_encoder = torch.load(weights_encoder, map_location=torch.device("cpu"))["model"]
-        weights_encoder = OrderedDict([(k.replace("_encoder.", ""), v) for k, v in weights_encoder.items()])
-        encoder.load_state_dict(weights_encoder)
+
+        if weights_encoder is not None:
+            weights_encoder = torch.load(weights_encoder, map_location=torch.device("cpu"))["model"]
+            weights_encoder = OrderedDict([(k.replace("_encoder.", ""), v) for k, v in weights_encoder.items()])
+            encoder.load_state_dict(weights_encoder)
 
         decoder_model = None
-        if decoder == "autoregressive":
-            decoder_model = AutoregressiveDecoder(6, cnn_model, alphabet).to(torch_device)
-        elif decoder == "mp_ctc":
-            decoder_model = MPCTC(6, cnn_model, 0.7, alphabet).to(torch_device)
+        if decoder == "ctc_lstm":
+            decoder_model = CTCLSTM(num_layers, dropout, alphabet).to(torch_device)
+        elif decoder == "ctc_lstm_self":
+            decoder_model = CTCLSTMSELF(num_layers, dropout, alphabet).to(torch_device)
+        elif decoder == "ctc_lstm_cross":
+            decoder_model = CTCLSTMCROSS(num_layers, dropout, alphabet).to(torch_device)
         elif decoder == "ctc_enhanced":
-            decoder_model = CTCEnhanced(6, cnn_model, alphabet).to(torch_device)
-        elif decoder == "laso":
-            decoder_model = LASO(cnn_model, alphabet).to(torch_device)
-        elif decoder == "ctc_lstm":
-            decoder_model = CTCLSTM(alphabet).to(torch_device)
-        elif decoder == "lstm_autoregressive":
-            decoder_model = LSTMAutoregressive(alphabet).to(torch_device)
+            decoder_model = CTCEnhanced(num_layers, dropout, alphabet).to(torch_device)
+        elif decoder == "mp_ctc_lstm":
+            decoder_model = MPCTCLSTM(num_layers, 0.99, dropout, alphabet).to(torch_device)
+        elif decoder == "mp_ctc_lstm_self":
+            decoder_model = MPCTCLSTMSELF(num_layers, 0.99, dropout, alphabet).to(torch_device)
+        elif decoder == "mp_ctc_lstm_cross":
+            decoder_model = MPCTCLSTMCROSS(num_layers, 0.99, dropout, alphabet).to(torch_device)
+        elif decoder == "mp_ctc":
+            decoder_model = MPCTC(num_layers, 0.99, dropout, alphabet).to(torch_device)
 
         return OCRModel(encoder, decoder_model).to(torch_device)
 
@@ -414,9 +485,9 @@ def run(dataset: str,
         learning_rate: float,
         weight_decay: float,
         dropout: float,
-        decoder_loss: str,
         weight: float,
-        encoder_freeze: bool
+        encoder_freeze: bool,
+        mask: bool
         ) -> None:
     f = open(osp.join(dataset, "ground_truths", type + ".txt"), "r")
     lines = f.readlines()
@@ -434,6 +505,7 @@ def run(dataset: str,
                              alphabet,
                              path_to_folder,
                              True,
+                             mask,
                              path_to_train_split,
                              fixed_height,
                              fixed_width)
@@ -443,6 +515,7 @@ def run(dataset: str,
                              alphabet,
                              path_to_folder,
                              False,
+                             mask,
                              path_to_valid_split,
                              fixed_height,
                              fixed_width)
@@ -464,13 +537,11 @@ def run(dataset: str,
     model = init_model(decoder, cnn_model, num_layers, torch_device, alphabet, weights_encoder, dropout, encoder_freeze)
 
     ctc_loss = nn.CTCLoss(zero_infinity=True, blank=len(alphabet) - 1).to(torch_device)
-    ce_loss = None
-    if decoder_loss == "focal":
-        ce_loss = FocalLoss(gamma=2)
-    elif decoder_loss == "cross-entropy":
-        ce_loss = nn.CrossEntropyLoss(label_smoothing=0.2, reduction="mean", ignore_index=len(alphabet) - 1)
+    ce_loss = nn.CrossEntropyLoss(label_smoothing=0.2,
+                                  reduction="mean",
+                                  ignore_index=len(alphabet) - 1)
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = MultiStepLR(optimizer, [int(.5 * n_epochs), int(.75 * n_epochs)])
+    scheduler = MultiStepLR(optimizer, [int(.33 * n_epochs), int(.66 * n_epochs)])
     start_epoch = -1
 
     if weights is not None:
@@ -483,6 +554,7 @@ def run(dataset: str,
         else:
             raise ValueError("Weights do not exist.")
 
+    min_cer = None
     for epoch in range(start_epoch + 1, n_epochs):
         train(model,
               ctc_loss,
@@ -498,18 +570,18 @@ def run(dataset: str,
               weight,
               encoder_freeze)
 
-        evaluation(model,
-                   ctc_loss,
-                   ce_loss,
-                   valid_loader,
-                   torch_device,
-                   epoch,
-                   n_epochs,
-                   osp.join(save_dir, eval_log),
-                   alphabet,
-                   decoder,
-                   weight,
-                   encoder_freeze)
+        cer = evaluation(model,
+                         ctc_loss,
+                         ce_loss,
+                         valid_loader,
+                         torch_device,
+                         epoch,
+                         n_epochs,
+                         osp.join(save_dir, eval_log),
+                         alphabet,
+                         decoder,
+                         weight,
+                         encoder_freeze)
 
         scheduler.step()
         checkpoint = {
@@ -518,7 +590,11 @@ def run(dataset: str,
             "scheduler": scheduler.state_dict(),
             "model": model.state_dict()
         }
-        torch.save(checkpoint, osp.join(save_model, f"model_{epoch}.pth"))
+        torch.save(checkpoint, osp.join(save_model, f"model_{epoch + 1}.pth"))
+
+        if min_cer is None or cer < min_cer:
+            min_cer = cer
+            torch.save(checkpoint, osp.join(save_model, f"best_model_{epoch + 1}.pth"))
 
 
 if __name__ == '__main__':
@@ -546,6 +622,6 @@ if __name__ == '__main__':
         config["ocr"]["learning_rate"],
         config["ocr"]["weight_decay"],
         config["ocr"]["dropout"],
-        config["ocr"]["decoder_loss"],
         config["ocr"]["weight"],
-        config["ocr"]["encoder_freeze"])
+        config["ocr"]["encoder_freeze"],
+        config["ocr"]["mask"])
